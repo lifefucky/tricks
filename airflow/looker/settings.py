@@ -3,7 +3,7 @@ import looker_sdk
 from looker_sdk import api_settings
 from airflow.hooks.base import BaseHook
 
-looker = BaseHook.get_connection("LOOKER_LOOKER")
+looker = BaseHook.get_connection("LOOKER")
 
 class LookerAuthSettings(api_settings.ApiSettings):
     def __init__(self, *args, **kw_args):

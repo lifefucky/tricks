@@ -8,7 +8,7 @@ from snowflake.connector.pandas_tools import write_pandas
 
 def dashboard_build_data(parent_folder) -> None:
     print(f"""\n\n\nStart to parse folder:'{parent_folder}'\n\n""")
-    snf = BaseHook.get_hook('SNOWFLAKE')
+    snf = BaseHook.get_hook('snowflake_conn_id')
     sdk = looker_sdk.init40(config_settings=LookerAuthSettings(my_var="looker"))
     
     parent_folder_ids = []
@@ -20,7 +20,7 @@ def dashboard_build_data(parent_folder) -> None:
     else:
         raise AirflowSkipException(f"""\n{parent_folder}: Too many folders found with this name!\n""")
     
-    creators_data = snf.get_pandas_df("SELECT * FROM MONITORING.LOOKER_CREATORS")
+    creators_data = snf.get_pandas_df("SELECT NAME, EMAIL FROM ERP.USERS WHERE ACTIVE")
     
     dashboards = []
     for folder_id in parent_folder_ids:
@@ -30,10 +30,10 @@ def dashboard_build_data(parent_folder) -> None:
             for dashboard in folder.dashboards:
                 dashboard_id = dashboard.id
                 dashboard_name = dashboard.title 
-                creators = [creators_data.loc[creators_data['CREATOR']==creator.display_name]['EMAIL'].iloc[0] for creator in sdk.search_users(id = dashboard.user_id)]
-                if not len(creators):
-                    creators = [creator.display_name for creator in sdk.search_users(id = dashboard.user_id)]
                 
+                creators = [creators_data.loc[creators_data['NAME']==creator.display_name] for creator in sdk.search_users(id = dashboard.user_id)]
+                creators = [creator.EMAIL.iloc[0] if creator.shape[0] else 'test@mail.ru' for creator in creators]
+
                 dashboards += [{'DASHBOARD_ID':dashboard_id, 'DASHBOARD_NAME': dashboard_name, 'CREATOR': creators}]
             child_folders = [child_folder.id for child_folder in sdk.search_folders(parent_id=folder.id)]
             if len(child_folders):
@@ -41,7 +41,7 @@ def dashboard_build_data(parent_folder) -> None:
 
     df = pd.DataFrame(dashboards)
     snf.run("""CREATE OR REPLACE TABLE TEMP.DASHBOARD_DATA(dashboard_id VARCHAR(100),dashboard_name VARCHAR(1000), creator ARRAY);""")
-    #snf = BaseHook.get_hook('XOMETRY_EU_SNOWFLAKE')
+    #snf = BaseHook.get_hook('snowflake_conn_id')
     write_pandas(snf.get_conn(),
                  df,
                  table_name='DASHBOARD_DATA',
@@ -50,13 +50,12 @@ def dashboard_build_data(parent_folder) -> None:
 def elements_build_data() -> None:
     import time
     
-    snf = BaseHook.get_hook('SNOWFLAKE')
+    snf = BaseHook.get_hook('snowflake_conn_id')
     sdk = looker_sdk.init40(config_settings=LookerAuthSettings(my_var="looker"))
 
     datamarts = snf.get_pandas_df(f"""
         SELECT MART_NAME
         FROM MONITORING.DATA_MARTS_METRICS
-        WHERE SQL_CHECK IS NOT NULL
         """)['MART_NAME'].tolist()
 
     dashboards = snf.get_pandas_df(f"""
@@ -85,16 +84,7 @@ def elements_build_data() -> None:
         print(f"""\n\nParsing dashboard number {str(id)}\n""")
         dashboard_elements = dashboard.dashboard_elements
         for element in dashboard_elements:
-            '''if not len(elements) % 50 and len(elements)>1:
-                time.sleep(15)
-                sdk = looker_sdk.init40(config_settings=LookerAuthSettings(my_var="looker"))
-                
-                df = pd.DataFrame(elements)
-                write_pandas(snf.get_conn(),
-                    df,
-                    table_name='ELEMENT_DATA',
-                    schema='TEMP')
-                elements = []'''
+
             print(f"""\n\n\tSearching for data of element number {element.id}\n""")
             element_id = element.id
             if element_id in exist_elements:
@@ -113,7 +103,7 @@ def elements_build_data() -> None:
                 element_view += [filterable.view for filterable in element.result_maker.filterables]
             
             query = ''
-            if 'target_model where mart views placed' in element_model:
+            if 'snowflake_conn_id' in element_model:
                 try:
                     if not element.query_id is None:
                         query = sdk.run_query(element.query_id, result_format="sql")

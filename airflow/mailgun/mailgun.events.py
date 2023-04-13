@@ -3,7 +3,6 @@ from airflow.hooks.base import BaseHook
 from airflow.operators.python import PythonOperator
 from snowflake.connector.pandas_tools import write_pandas
 
-import common.monitoring as mn
 
 import requests
 import json

@@ -1,20 +1,63 @@
-from airflow.hooks.base_hook import BaseHook
-import pandas as pd
-from slack_sdk.webhook import WebhookClient
 import datetime
-from looker.looker_monitoring import looker_alerts
+
+from airflow import DAG
+from airflow.exceptions import AirflowFailException
+from airflow.utils.task_group import TaskGroup
+from dags.sys.looker.looker_monitoring import looker_alerts
+from slack_sdk.webhook import WebhookClient
 
 
-snf =  BaseHook.get_hook('SNOWFLAKE')
+def get_credentials(mart_name):
+    '''Receive sql script for comparing with ERP sources and identity keys'''
+    from airflow.hooks.base_hook import BaseHook
 
-def if_any_duplicates(mart_name, id_column):
+    import os
+    import glob
+    from pathlib import Path
+
+    path_to_main = Path(__file__).resolve()
+    while True:
+        path_to_main = path_to_main.parent
+        if os.path.basename(path_to_main) == 'dags':
+            break
+    path_path = os.path.abspath(path_to_main)
+
+    files_next = [{'FILE': os.path.basename(x), 'PATH': os.path.abspath(x)} for x in
+                  glob.glob(path_path + '/mart/*/dq_check_query/*.sql')]
+
+    print(files_next)
+    mart_idx = [i['FILE'].upper().replace('.SQL', '') for i in files_next].index(mart_name)
+    with open(files_next[mart_idx]['PATH'], 'r') as sql_file:
+        sql_query = sql_file.read()
+
+    snf = BaseHook.get_hook('hook')
+    fetch_identity_columns = \
+    snf.get_pandas_df("SELECT IDS, EXCEPTIONS FROM MONITORING.PRIMARY_KEYS WHERE MART_NAME='{}'".format(mart_name))
+    ids = fetch_identity_columns.IDS.iloc[0].split("|")
+    exceptions = fetch_identity_columns.EXCEPTIONS.iloc[0]
+    add_exceptions =  '' if exceptions is None else ' AND {}'.format(exceptions)
+
+    return {'MART': mart_name, 'IDS': ids, 'SQL': sql_query, 'EXCEPTION': add_exceptions}
+
+
+def if_any_duplicates(mart_name, id_column, exception):
+    '''Check existing duplicates using received identity keys'''
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+    from airflow.hooks.base_hook import BaseHook
+
+    from slack_sdk.webhook import WebhookClient
+
+    from dags.sys.looker.looker_monitoring import looker_alerts
+
+    snf = BaseHook.get_hook('snowflake_conn')
     print(f'\n\n\nStarted looking for duplicates in {mart_name} after last upload\n\n\n')
-    
+
     snf.run(f"""
         CREATE OR REPLACE TABLE TEMP.{mart_name}_duplicates
         AS 
         SELECT {','.join(id_column)} 
         FROM MART.{mart_name} mart
+        WHERE 1=1 {exception}
         GROUP BY {','.join(id_column)}
         HAVING COUNT(*)>1""")
 
@@ -31,22 +74,37 @@ def if_any_duplicates(mart_name, id_column):
                     *Details*: TEMP.{mart}_duplicates
                     Hey, {mention}!
                     """.format(
-                        mart=mart_name,
-                        mention='@User')
-        webhook = WebhookClient(BaseHook.get_connection('monitoring').host)
+            mart=mart_name,
+            mention='<!subteam^S000000000000>')
+        webhook = WebhookClient(BaseHook.get_connection('slack_bot_monitoring').host)
         webhook.send(text=slack_msg)
-        error =  True
+        error = True
     else:
         snf.run(f"DROP TABLE TEMP.{mart_name}_duplicates")
 
     looker_alerts(is_error=error, mart_name=mart_name, error_type='Duplicates')
-            
+
+    if error:
+        raise AirflowFailException(f"""\nWe need rerun!\n""")
+    else:
+        raise AirflowSkipException(f"""\nFine!!\n""")
+
+
 def if_any_unsufficients(mart_name, sql_check, id_column):
+    '''Compare mart with ERP using received sql script - if we have old data (<current_date) not existing in mart'''
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+    from airflow.hooks.base_hook import BaseHook
+
+    from slack_sdk.webhook import WebhookClient
+
+    from dags.sys.looker.looker_monitoring import looker_alerts
+
+    snf = BaseHook.get_hook('snowflake_conn')
     print(f'\n\n\nStarted looking for unsufficient data in {mart_name} after last upload\n\n\n')
     snf.run(f"""
         CREATE OR REPLACE TABLE TEMP.{mart_name}_unsuff_err
         AS 
-        SELECT {','.join(['base.'+i for i in id_column])} 
+        SELECT {','.join(['base.' + i for i in id_column])} 
         FROM ({sql_check}) base
         LEFT JOIN MART.{mart_name} mart ON {' AND '.join(['base.{id_col}=mart.{id_col}'.format(id_col=i) for i in id_column])}
         WHERE mart.{id_column[0]} IS NULL
@@ -64,102 +122,47 @@ def if_any_unsufficients(mart_name, sql_check, id_column):
                         *Details*: TEMP.{mart}_unsuff_err
                         Hey, {mention}!
                         """.format(
-                        mart=mart_name,
-                        mention='@user')
-        webhook = WebhookClient(BaseHook.get_connection('monitoring').host)
+            mart=mart_name,
+            mention='<!subteam^S000000000000>')
+        webhook = WebhookClient(BaseHook.get_connection('slack_bot_monitoring').host)
         webhook.send(text=slack_msg)
         error = True
     else:
         snf.run(f"DROP TABLE TEMP.{mart_name}_unsuff_err")
 
-    looker_alerts(is_error=error, mart_name=mart_name, error_type = 'Unsufficient data')
+    looker_alerts(is_error=error, mart_name=mart_name, error_type='Unsufficient data')
+
+    if error:
+        raise AirflowFailException(f"""\nWe need rerun!\n""")
+    else:
+        raise AirflowSkipException(f"""\nFine!!\n""")
 
 
-def log_changes_metadata(mart_name):
-    print(f'\n\n\nWriting sums of quantity values from {mart_name} to monitoring log table \n\n\n')
-    t1 =  datetime.datetime.now().replace(hour=0, minute=0, second=0).strftime('%Y-%m-%d %H:%M:%S')
-    snf.run(f"""
-        CREATE OR REPLACE TABLE TEMP.{mart_name}_CHECK
-        AS
-        SELECT report_date
-        FROM (
-        SELECT * 
-        FROM (
-            SELECT 
-	            *
-            FROM mart.{mart_name} 
-                changes(information => default)
-                at(timestamp => '{t1}'::timestamp) ) BASE 
-        WHERE 1=1 )base
-        GROUP BY 1""")
+def easy_quality(dag: DAG, mart_dict) -> TaskGroup:
+    '''Data Quality TaskGroup to import in mart dags'''
+    from airflow.operators.python import PythonOperator
+    from airflow.utils.task_group import TaskGroup
 
-    mart_cols  =  snf.get_pandas_df(f"""
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE table_schema='MART' 
-        AND table_name='{mart_name}' 
-        AND DATA_TYPE IN ('FLOAT', 'NUMBER')
-        AND NOT ENDSWITH(COLUMN_NAME, 'ID')
-        ORDER BY ordinal_position """)['COLUMN_NAME'].tolist()
-        
-    monitor_cols = snf.get_pandas_df(f"""
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE table_schema='MONITORING' 
-        AND table_name='{mart_name}' 
-        AND DATA_TYPE IN ('FLOAT', 'NUMBER')
-        AND NOT ENDSWITH(COLUMN_NAME, 'ID')
-        ORDER BY ordinal_position """)['COLUMN_NAME'].tolist()
-        
-    diff =  [col for col in mart_cols if not col in monitor_cols]
-    if len(diff):
-        slack_msg = """
-                        :yellow_circle: Please add column/-s {columns} to MONITORING.{mart}
-                        Hey, {mention}!
-                        """.format(
-                            columns=','.join(["'{col}'".format(col=i) for i in diff]),
-                            mart=mart_name,
-                            mention='@User')
-        webhook = WebhookClient(BaseHook.get_connection('smonitoring').host)
-        webhook.send(text=slack_msg)
-            
-    snf.run(f"""
-            INSERT INTO MONITORING.{mart_name}
-            SELECT CURRENT_DATE tdate, mart.report_date, {','.join(['SUM({col}) {col}'.format(col=i) for i in monitor_cols])}
-            FROM MART.{mart_name} mart
-            JOIN TEMP.{mart_name}_CHECK check_ ON mart.report_date=check_.report_date  
-            GROUP BY 2""") 
-    snf.run(f"""DROP TABLE TEMP.{mart_name}_CHECK;""")
-    snf.run(f"""
-        DELETE FROM monitoring.{mart_name} monitoring
-        USING (
-        SELECT tdate, report_date
-        FROM monitoring.{mart_name}
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY REPORT_DATE, {','.join(monitor_cols)} ORDER BY tdate)>1) cte  
-        WHERE monitoring.tdate=cte.tdate AND monitoring.report_date=cte.report_date ;""")
+    easy_taskgroup = TaskGroup(group_id="easy_taskgroup_{}".format(mart_dict['MART']), dag=dag)
 
-def first_monitore(mart_name):
-    mart_metrics = snf.get_pandas_df(f"""
-        SELECT MART_NAME, SQL_CHECK, ID_COLUMN 
-        FROM MONITORING.DATA_MARTS_METRICS
-        WHERE SQL_CHECK IS NOT NULL
-        AND MART_NAME='{mart_name}'""")
-    mart_name_ = mart_metrics['MART_NAME'].tolist()[0]
-    sql_check_ = mart_metrics['SQL_CHECK'].tolist()[0]
-    id_column_ = [i for i in mart_metrics['ID_COLUMN'].tolist()[0].split("|")]
-        
-    if_any_duplicates(mart_name_, id_column_)
-    if_any_unsufficients(mart_name_, sql_check_, id_column_)
-    log_changes_metadata(mart_name_)
+    duplicates = PythonOperator(
+        task_id="duplicates_{}".format(mart_dict['MART']),
+        task_group=easy_taskgroup,
+        python_callable=test_if_any_duplicates,
+        op_kwargs={'mart_name': mart_dict['MART'], 'id_column': mart_dict['IDS'], 'exception': mart_dict['EXCEPTION']},
+        trigger_rule='all_done',
+        dag=dag,
+    )
 
+    unsufficients = PythonOperator(
+        task_id="unsufficients_{}".format(mart_dict['MART']),
+        task_group=easy_taskgroup,
+        python_callable=test_if_any_unsufficients,
+        op_kwargs={'mart_name': mart_dict['MART'], 'sql_check': mart_dict['SQL'], 'id_column': mart_dict['IDS']},
+        trigger_rule='all_done',
+        dag=dag,
+    )
 
+    duplicates >> unsufficients
 
-
-
-
-
-
-
-
-
-
+    return easy_taskgroup
